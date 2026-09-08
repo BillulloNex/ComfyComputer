@@ -17,12 +17,14 @@ export HOME=/home/kasm-user
 
 # 1. Launch Google Chrome on localhost:9223 (with --remote-allow-origins=*)
 echo "[$(date)] Starting Google Chrome on port 9223..."
+mkdir -p /home/kasm-user/.config/google-chrome-cdp
 google-chrome-stable \
     --no-sandbox \
     --disable-dev-shm-usage \
     --disable-gpu \
     --remote-debugging-port=9223 \
     --remote-allow-origins="*" \
+    --user-data-dir=/home/kasm-user/.config/google-chrome-cdp \
     --no-first-run \
     --no-default-browser-check \
     --start-maximized \
@@ -42,7 +44,7 @@ CUA_PID=$!
 echo "[$(date)] Background services launched: Chrome (PID $CHROME_PID), Socat (PID $SOCAT_PID), Cua Server (PID $CUA_PID)"
 
 # Wait for services to bind and run initial local self-tests
-sleep 3
+sleep 10
 echo "[$(date)] Testing local Chrome CDP (port 9222)..."
 curl -s http://127.0.0.1:9222/json/version || echo "Local CDP curl failed"
 echo "[$(date)] Testing local Cua Server (port 8000)..."
@@ -58,6 +60,7 @@ while true; do
             --disable-gpu \
             --remote-debugging-port=9223 \
             --remote-allow-origins="*" \
+            --user-data-dir=/home/kasm-user/.config/google-chrome-cdp \
             --no-first-run \
             --no-default-browser-check \
             --start-maximized \
