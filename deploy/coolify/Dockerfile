@@ -45,9 +45,11 @@ RUN update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1
     && curl -sS https://bootstrap.pypa.io/get-pip.py | python3.12 \
     && pip install uv
 
-# 4. Disable mandatory SSL in KasmVNC (Traefik in Coolify terminates SSL at the edge)
+# 4. Disable mandatory SSL in KasmVNC (Traefik in Coolify terminates SSL at the edge) and fix custom_startup service watchdog
 RUN sed -i 's/require_ssl: true/require_ssl: false/g' /usr/share/kasmvnc/kasmvnc_defaults.yaml \
-    && sed -i 's/-sslOnly//g' /dockerstartup/vnc_startup.sh
+    && sed -i 's/-sslOnly//g' /dockerstartup/vnc_startup.sh \
+    && sed -i 's/custom_script)/custom_startup|custom_script)/g' /dockerstartup/vnc_startup.sh
+
 
 # 5. Enable sudo without password for kasm-user
 RUN echo "kasm-user:password" | chpasswd \
