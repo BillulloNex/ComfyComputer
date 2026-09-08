@@ -31,17 +31,17 @@ google-chrome-stable \
     https://cua.ai &
 CHROME_PID=$!
 
-# 2. Launch socat to expose 0.0.0.0:9222 -> 127.0.0.1:9223
-echo "[$(date)] Starting socat bridge on 0.0.0.0:9222 -> 127.0.0.1:9223..."
-socat TCP-LISTEN:9222,fork,reuseaddr TCP:127.0.0.1:9223 &
-SOCAT_PID=$!
+# 2. Launch cdp_proxy on 0.0.0.0:9222 -> 127.0.0.1:9223 (translates host headers & WebSocket URLs)
+echo "[$(date)] Starting CDP Proxy on 0.0.0.0:9222 -> 127.0.0.1:9223..."
+/usr/bin/python3 /dockerstartup/cdp_proxy.py &
+CDP_PID=$!
 
 # 3. Launch Cua Computer Server on 0.0.0.0:8000 (direct logging to console)
 echo "[$(date)] Starting Cua Computer Server on 0.0.0.0:8000..."
 /usr/bin/python3 -m computer_server --host 0.0.0.0 --port 8000 &
 CUA_PID=$!
 
-echo "[$(date)] Background services launched: Chrome (PID $CHROME_PID), Socat (PID $SOCAT_PID), Cua Server (PID $CUA_PID)"
+echo "[$(date)] Background services launched: Chrome (PID $CHROME_PID), CDP Proxy (PID $CDP_PID), Cua Server (PID $CUA_PID)"
 
 # Wait for services to bind and run initial local self-tests
 sleep 10
@@ -67,10 +67,10 @@ while true; do
             https://cua.ai &
         CHROME_PID=$!
     fi
-    if ! kill -0 "$SOCAT_PID" 2>/dev/null; then
-        echo "[$(date)] Socat stopped, restarting on port 9222..."
-        socat TCP-LISTEN:9222,fork,reuseaddr TCP:127.0.0.1:9223 &
-        SOCAT_PID=$!
+    if ! kill -0 "$CDP_PID" 2>/dev/null; then
+        echo "[$(date)] CDP Proxy stopped, restarting on port 9222..."
+        /usr/bin/python3 /dockerstartup/cdp_proxy.py &
+        CDP_PID=$!
     fi
     if ! kill -0 "$CUA_PID" 2>/dev/null; then
         echo "[$(date)] Cua Computer Server stopped, restarting on port 8000..."

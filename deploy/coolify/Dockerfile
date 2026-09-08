@@ -77,9 +77,10 @@ RUN python3.12 -m playwright install --with-deps chromium
 # 9. Clean uv cache to reduce image size
 RUN rm -rf /home/kasm-user/.cache/uv /root/.cache/uv
 
-# 10. Copy custom startup script
+# 10. Copy custom startup script and CDP proxy
 COPY deploy/coolify/custom_startup.sh $STARTUPDIR/custom_startup.sh
-RUN chmod +x $STARTUPDIR/custom_startup.sh && chown 1000:0 $STARTUPDIR/custom_startup.sh
+COPY deploy/coolify/cdp_proxy.py $STARTUPDIR/cdp_proxy.py
+RUN chmod +x $STARTUPDIR/custom_startup.sh $STARTUPDIR/cdp_proxy.py && chown 1000:0 $STARTUPDIR/custom_startup.sh $STARTUPDIR/cdp_proxy.py
 
 USER 1000
 
