@@ -1,0 +1,25 @@
+version: '3.8'
+
+services:
+  agent-computer:
+    build:
+      context: ../../
+      dockerfile: deploy/coolify/Dockerfile
+    image: agent-computer:latest
+    container_name: agent-computer
+    restart: unless-stopped
+    shm_size: '2gb'
+    ports:
+      - "6901:6901"
+      - "8000:8000"
+      - "9222:9222"
+    environment:
+      - VNC_PW=kasm123
+      - VNC_RESOLUTION=1920x1080
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.agent-computer.rule=Host(`computer.beenex.cloud`)"
+      - "traefik.http.routers.agent-computer.entrypoints=https"
+      - "traefik.http.routers.agent-computer.tls=true"
+      - "traefik.http.routers.agent-computer.tls.certresolver=letsencrypt"
+      - "traefik.http.services.agent-computer.loadbalancer.server.port=6901"
