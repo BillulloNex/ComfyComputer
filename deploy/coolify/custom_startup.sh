@@ -27,6 +27,7 @@ google-chrome-stable \
     --user-data-dir=/home/kasm-user/.config/google-chrome-cdp \
     --no-first-run \
     --no-default-browser-check \
+    --restore-last-session \
     --start-maximized \
     https://cua.ai &
 CHROME_PID=$!

@@ -1,0 +1,33 @@
+version: '3.8'
+
+services:
+  orchestrator:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: cua-orchestrator:latest
+    container_name: cua-orchestrator
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    volumes:
+      # Access host Docker to manage computer containers
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Persistent SQLite database
+      - orchestrator-data:/data
+    environment:
+      # Docker image used for computers (build separately via Coolify)
+      - COMPUTER_IMAGE=agent-computer:latest
+      # Max concurrent running computers (4 vCPU / 16 GB server ≈ 3)
+      - MAX_RUNNING_COMPUTERS=3
+      # Max total computers (including stopped)
+      - MAX_TOTAL_COMPUTERS=20
+      # Public host address for endpoint URLs returned by the API
+      - HOST_ADDRESS=${HOST_ADDRESS:-localhost}
+      # Auto-stop idle computers after 30 minutes
+      - IDLE_TIMEOUT_MINUTES=30
+      # VNC password for spawned computers
+      - VNC_PASSWORD=kasm123
+
+volumes:
+  orchestrator-data:
