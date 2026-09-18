@@ -74,6 +74,43 @@ class AuthMiddleware(BaseHTTPMiddleware):
 # ---------------------------------------------------------------------------
 
 _idle_task: asyncio.Task | None = None
+_boot_tasks: set[asyncio.Task] = set()
+
+
+async def _boot_computer(computer_id: str) -> None:
+    """Create the container and wait for healthy, detached from the request.
+
+    POST /computers returns 201 immediately; the agent polls GET until
+    `running`. On failure the row is marked `error` (visible via GET/list —
+    the agent destroys and re-claims; ports free on destroy).
+    """
+    try:
+        comp = await db.get_computer(computer_id)
+        if comp is None:
+            return
+        container_id = await docker_manager.create_container(
+            computer_id=computer_id,
+            vnc_port=comp["vnc_port"],
+            cs_port=comp["cs_port"],
+            cdp_port=comp["cdp_port"],
+            cpu_limit=comp["cpu_limit"],
+            memory_limit=comp["memory_limit"],
+            shm_size=comp["shm_size"],
+            resolution=comp["resolution"],
+        )
+        await db.update_computer(computer_id, container_id=container_id)
+        healthy = await docker_manager.wait_for_healthy(comp["cs_port"])
+        await db.update_computer(
+            computer_id, status="running" if healthy else "error",
+        )
+        if not healthy:
+            logger.error("Computer %s never became healthy — marked error", computer_id)
+    except Exception:
+        logger.exception("Boot failed for computer %s", computer_id)
+        try:
+            await db.update_computer(computer_id, status="error")
+        except Exception:
+            pass
 
 
 async def _idle_monitor() -> None:
@@ -210,22 +247,6 @@ async def _do_stop(computer_id: str) -> dict:
     return comp
 
 
-async def _gc_failed_create(computer_id: str) -> None:
-    """Remove all traces of a create that never became healthy.
-
-    Without this, failed creates sit in `error` holding their port triple
-    forever and the pool slowly drains. Best-effort: never raise.
-    """
-    try:
-        await docker_manager.remove_container(computer_id)
-    except Exception:
-        logger.warning("GC: container removal failed for %s", computer_id, exc_info=True)
-    try:
-        await db.delete_computer(computer_id)
-    except Exception:
-        logger.warning("GC: row delete failed for %s", computer_id, exc_info=True)
-
-
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -245,7 +266,11 @@ async def health():
 
 @app.post("/computers", response_model=ComputerResponse, status_code=201)
 async def create_computer(req: CreateComputerRequest | None = None):
-    """Create and start a new computer.
+    """Reserve and boot a new computer (async).
+
+    Returns 201 with `status: creating` immediately — booting a desktop takes
+    minutes, far past edge-proxy timeouts. Poll `GET /computers/{id}` until
+    `running` (or `error`, in which case destroy and re-claim).
 
     Idempotent per owner: repeat POSTs with the same `owner` (e.g.
     `starship:conv-<id>`) return the existing creating/running computer
@@ -283,19 +308,16 @@ async def create_computer(req: CreateComputerRequest | None = None):
     # inside reserve_computer (no check-then-act race under parallel claims).
     computer_id = _short_id()
     name = req.name or f"computer-{computer_id}"
-    cpu_limit = req.cpu_limit or Config.DEFAULT_CPU_LIMIT
-    memory_limit = req.memory_limit or Config.DEFAULT_MEMORY_LIMIT
-    resolution = req.resolution or Config.DEFAULT_RESOLUTION
 
     try:
         comp = await db.reserve_computer(
             computer_id=computer_id,
             name=name,
             owner=req.owner,
-            cpu_limit=cpu_limit,
-            memory_limit=memory_limit,
+            cpu_limit=req.cpu_limit or Config.DEFAULT_CPU_LIMIT,
+            memory_limit=req.memory_limit or Config.DEFAULT_MEMORY_LIMIT,
             shm_size=Config.DEFAULT_SHM_SIZE,
-            resolution=resolution,
+            resolution=req.resolution or Config.DEFAULT_RESOLUTION,
             vnc_start=Config.PORT_RANGE_VNC_START,
             cs_start=Config.PORT_RANGE_COMPUTER_START,
             cdp_start=Config.PORT_RANGE_CDP_START,
@@ -304,39 +326,10 @@ async def create_computer(req: CreateComputerRequest | None = None):
     except RuntimeError as e:
         raise HTTPException(status_code=429, detail=str(e))
 
-    vnc_port, cs_port, cdp_port = comp["vnc_port"], comp["cs_port"], comp["cdp_port"]
-
-    # Create and start Docker container
-    try:
-        container_id = await docker_manager.create_container(
-            computer_id=computer_id,
-            vnc_port=vnc_port,
-            cs_port=cs_port,
-            cdp_port=cdp_port,
-            cpu_limit=cpu_limit,
-            memory_limit=memory_limit,
-            shm_size=Config.DEFAULT_SHM_SIZE,
-            resolution=resolution,
-        )
-        await db.update_computer(computer_id, container_id=container_id)
-
-        # Wait for computer-server to be healthy
-        healthy = await docker_manager.wait_for_healthy(cs_port)
-        if healthy:
-            comp = await db.update_computer(computer_id, status="running")
-        else:
-            await _gc_failed_create(computer_id)
-            raise HTTPException(
-                status_code=503,
-                detail="Computer started but computer-server did not become healthy in time. "
-                "Claim cleaned up — retry the request.",
-            )
-    except HTTPException:
-        raise
-    except Exception as e:
-        await _gc_failed_create(computer_id)
-        logger.exception("Failed to create computer %s", computer_id)
-        raise HTTPException(status_code=500, detail=str(e))
+    # Boot detached: container create + health wait run past any edge timeout.
+    task = asyncio.create_task(_boot_computer(computer_id))
+    _boot_tasks.add(task)
+    task.add_done_callback(_boot_tasks.discard)
 
     return _to_response(comp)
 

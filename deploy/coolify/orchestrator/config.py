@@ -60,6 +60,7 @@ class Config:
     # a broker restart never re-keys them.)
     VNC_PASSWORD: str = os.getenv("VNC_PASSWORD", "")
 
-    # Health check
-    HEALTH_CHECK_TIMEOUT: int = int(os.getenv("HEALTH_CHECK_TIMEOUT", "120"))
-    HEALTH_CHECK_INTERVAL: int = int(os.getenv("HEALTH_CHECK_INTERVAL", "2"))
+    # Health check (boot runs detached from the request, so this can exceed
+    # edge-proxy timeouts safely).
+    HEALTH_CHECK_TIMEOUT: int = int(os.getenv("HEALTH_CHECK_TIMEOUT", "300"))
+    HEALTH_CHECK_INTERVAL: int = int(os.getenv("HEALTH_CHECK_INTERVAL", "5"))
