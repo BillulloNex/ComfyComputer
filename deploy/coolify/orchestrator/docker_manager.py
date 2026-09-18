@@ -44,19 +44,11 @@ def ensure_network() -> None:
 
 # ---------------------------------------------------------------------------
 # Port allocation
+#
+# NOTE: live allocation happens atomically in db.reserve_computer()
+# (triple selection + row insert under one lock). Do NOT reintroduce an
+# allocate-then-insert split here — parallel claims will collide.
 # ---------------------------------------------------------------------------
-
-
-async def allocate_ports() -> tuple[int, int, int]:
-    """Find the next free (vnc, computer_server, cdp) port triple."""
-    used = await db.get_allocated_ports()
-    for offset in range(Config.PORT_RANGE_SIZE):
-        vnc = Config.PORT_RANGE_VNC_START + offset
-        cs = Config.PORT_RANGE_COMPUTER_START + offset
-        cdp = Config.PORT_RANGE_CDP_START + offset
-        if vnc not in used and cs not in used and cdp not in used:
-            return vnc, cs, cdp
-    raise RuntimeError("No free ports available — increase PORT_RANGE_SIZE or destroy unused computers.")
 
 
 # ---------------------------------------------------------------------------

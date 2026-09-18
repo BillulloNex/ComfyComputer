@@ -18,6 +18,7 @@ CREATE TABLE IF NOT EXISTS computers (
     name            TEXT NOT NULL,
     status          TEXT NOT NULL DEFAULT 'creating',
     container_id    TEXT,
+    owner           TEXT,
     vnc_port        INTEGER NOT NULL,
     cs_port         INTEGER NOT NULL,
     cdp_port        INTEGER NOT NULL,
@@ -39,6 +40,23 @@ CREATE TABLE IF NOT EXISTS snapshots (
 );
 """
 
+# Migrations for databases created before a column existed. Applied on every
+# connect (cheap PRAGMA check) so broker upgrades never need manual SQL.
+MIGRATIONS = [
+    "ALTER TABLE computers ADD COLUMN owner TEXT",
+]
+
+
+async def _apply_migrations(db: aiosqlite.Connection) -> None:
+    cursor = await db.execute("PRAGMA table_info(computers)")
+    cols = {row["name"] for row in await cursor.fetchall()}
+    for stmt in MIGRATIONS:
+        # Convention: each migration is ADD COLUMN <name> ...
+        col = stmt.split("ADD COLUMN")[1].split()[0].strip('"')
+        if col not in cols:
+            await db.execute(stmt)
+    await db.commit()
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -50,6 +68,7 @@ async def _get_db() -> aiosqlite.Connection:
     db.row_factory = aiosqlite.Row
     await db.executescript(SCHEMA)
     await db.commit()
+    await _apply_migrations(db)
     return db
 
 
@@ -65,6 +84,7 @@ async def create_computer(
     memory_limit: str,
     shm_size: str,
     resolution: str,
+    owner: str | None = None,
 ) -> dict:
     now = _now()
     async with _DB_LOCK:
@@ -72,11 +92,11 @@ async def create_computer(
         try:
             await db.execute(
                 """INSERT INTO computers
-                   (id, name, status, container_id, vnc_port, cs_port, cdp_port,
+                   (id, name, status, container_id, owner, vnc_port, cs_port, cdp_port,
                     cpu_limit, memory_limit, shm_size, resolution, created_at, last_activity)
-                   VALUES (?, ?, 'creating', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, 'creating', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
-                    computer_id, name, container_id,
+                    computer_id, name, container_id, owner,
                     vnc_port, cs_port, cdp_port,
                     cpu_limit, memory_limit, shm_size, resolution,
                     now, now,
@@ -84,6 +104,78 @@ async def create_computer(
             )
             await db.commit()
             return await _get_computer(db, computer_id)
+        finally:
+            await db.close()
+
+
+async def reserve_computer(
+    *,
+    computer_id: str,
+    name: str,
+    owner: str | None,
+    cpu_limit: str,
+    memory_limit: str,
+    shm_size: str,
+    resolution: str,
+    vnc_start: int,
+    cs_start: int,
+    cdp_start: int,
+    range_size: int,
+) -> dict:
+    """Atomically pick a free (vnc, computer-server, cdp) port triple AND
+    insert the computer row under a single lock hold.
+
+    The old allocate-then-insert path had a check-then-act race: two parallel
+    POST /computers could claim the same triple. This closes it.
+    """
+    now = _now()
+    async with _DB_LOCK:
+        db = await _get_db()
+        try:
+            cursor = await db.execute("SELECT vnc_port, cs_port, cdp_port FROM computers")
+            used: set[int] = set()
+            for r in await cursor.fetchall():
+                used.update([r["vnc_port"], r["cs_port"], r["cdp_port"]])
+            triple: tuple[int, int, int] | None = None
+            for offset in range(range_size):
+                cand = (vnc_start + offset, cs_start + offset, cdp_start + offset)
+                if all(p not in used for p in cand):
+                    triple = cand
+                    break
+            if triple is None:
+                raise RuntimeError(
+                    "No free ports available — increase PORT_RANGE_SIZE or destroy unused computers."
+                )
+            vnc_port, cs_port, cdp_port = triple
+            await db.execute(
+                """INSERT INTO computers
+                   (id, name, status, container_id, owner, vnc_port, cs_port, cdp_port,
+                    cpu_limit, memory_limit, shm_size, resolution, created_at, last_activity)
+                   VALUES (?, ?, 'creating', NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    computer_id, name, owner,
+                    vnc_port, cs_port, cdp_port,
+                    cpu_limit, memory_limit, shm_size, resolution,
+                    now, now,
+                ),
+            )
+            await db.commit()
+            return await _get_computer(db, computer_id)
+        finally:
+            await db.close()
+
+
+async def get_computer_by_owner(owner: str) -> dict | None:
+    """Newest non-destroyed computer for an owner (idempotent-claim lookup)."""
+    async with _DB_LOCK:
+        db = await _get_db()
+        try:
+            cursor = await db.execute(
+                "SELECT * FROM computers WHERE owner = ? ORDER BY created_at DESC LIMIT 1",
+                (owner,),
+            )
+            row = await cursor.fetchone()
+            return dict(row) if row else None
         finally:
             await db.close()
 
@@ -122,11 +214,17 @@ async def _get_computer(db: aiosqlite.Connection, computer_id: str) -> dict | No
     return dict(row)
 
 
-async def list_computers() -> list[dict]:
+async def list_computers(owner: str | None = None) -> list[dict]:
     async with _DB_LOCK:
         db = await _get_db()
         try:
-            cursor = await db.execute("SELECT * FROM computers ORDER BY created_at DESC")
+            if owner is not None:
+                cursor = await db.execute(
+                    "SELECT * FROM computers WHERE owner = ? ORDER BY created_at DESC",
+                    (owner,),
+                )
+            else:
+                cursor = await db.execute("SELECT * FROM computers ORDER BY created_at DESC")
             rows = await cursor.fetchall()
             return [dict(r) for r in rows]
         finally:
@@ -141,21 +239,6 @@ async def delete_computer(computer_id: str) -> bool:
             cursor = await db.execute("DELETE FROM computers WHERE id = ?", (computer_id,))
             await db.commit()
             return cursor.rowcount > 0
-        finally:
-            await db.close()
-
-
-async def get_allocated_ports() -> set[int]:
-    """Return all ports currently allocated (running or stopped, not destroyed)."""
-    async with _DB_LOCK:
-        db = await _get_db()
-        try:
-            cursor = await db.execute("SELECT vnc_port, cs_port, cdp_port FROM computers")
-            rows = await cursor.fetchall()
-            ports = set()
-            for r in rows:
-                ports.update([r["vnc_port"], r["cs_port"], r["cdp_port"]])
-            return ports
         finally:
             await db.close()
 

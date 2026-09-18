@@ -29,14 +29,36 @@ class Config:
     HOST_ADDRESS: str = os.getenv("HOST_ADDRESS", "localhost")
     DOCKER_NETWORK: str = os.getenv("DOCKER_NETWORK", "cua-computers")
 
+    # Public base URL for broker-proxied endpoints (what Starship/agents use).
+    # Defaults to http://HOST_ADDRESS:3000; in production set to the Coolify
+    # FQDN, e.g. https://computers.beenex.cloud
+    PUBLIC_BASE_URL: str = os.getenv(
+        "PUBLIC_BASE_URL", f"http://{os.getenv('HOST_ADDRESS', 'localhost')}:3000"
+    )
+
+    # API authentication. Fail-closed: when empty, every endpoint except
+    # /health returns 503. Set ORCHESTRATOR_API_KEY in Coolify (runtime var);
+    # local dev can use ALLOW_ANONYMOUS=true instead of a key.
+    API_KEY: str = os.getenv("ORCHESTRATOR_API_KEY", "")
+    ALLOW_ANONYMOUS: bool = os.getenv("ALLOW_ANONYMOUS", "false").lower() == "true"
+
+    # CORS origins for browser callers (VNC viewer etc). Comma-separated.
+    # Default deny — server-side agent traffic needs no CORS.
+    CORS_ORIGINS: list[str] = [
+        o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()
+    ]
+
     # Auto-idle timeout (minutes). 0 = disabled.
     IDLE_TIMEOUT_MINUTES: int = int(os.getenv("IDLE_TIMEOUT_MINUTES", "30"))
 
     # Database
     DB_PATH: str = os.getenv("DB_PATH", "/data/computers.db")
 
-    # VNC password for spawned computers
-    VNC_PASSWORD: str = os.getenv("VNC_PASSWORD", "kasm123")
+    # VNC password for spawned computers. Fail-closed at container start:
+    # crash loudly instead of baking every desktop with a known password.
+    # (Already-running computers keep the password from their own env —
+    # a broker restart never re-keys them.)
+    VNC_PASSWORD: str = os.getenv("VNC_PASSWORD", "")
 
     # Health check
     HEALTH_CHECK_TIMEOUT: int = int(os.getenv("HEALTH_CHECK_TIMEOUT", "120"))

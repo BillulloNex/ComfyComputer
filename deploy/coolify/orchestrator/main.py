@@ -8,12 +8,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import secrets
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
+import httpx
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from config import Config
 from models import (
@@ -36,6 +39,33 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
 )
 logger = logging.getLogger("orchestrator")
+
+
+# ---------------------------------------------------------------------------
+# Auth: fail-closed bearer key, /health stays open for Coolify healthchecks
+# ---------------------------------------------------------------------------
+
+_OPEN_PATHS = {"/health"}
+
+
+class AuthMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        if request.url.path in _OPEN_PATHS or Config.ALLOW_ANONYMOUS:
+            return await call_next(request)
+        if not Config.API_KEY:
+            return JSONResponse(
+                status_code=503,
+                content={"error": "misconfigured",
+                         "detail": "ORCHESTRATOR_API_KEY is not set and ALLOW_ANONYMOUS is false."},
+            )
+        auth = request.headers.get("authorization", "")
+        scheme, _, token = auth.partition(" ")
+        if scheme.lower() != "bearer" or not secrets.compare_digest(token, Config.API_KEY):
+            return JSONResponse(
+                status_code=401,
+                content={"error": "unauthorized", "detail": "Valid Bearer token required."},
+            )
+        return await call_next(request)
 
 
 # ---------------------------------------------------------------------------
@@ -77,6 +107,15 @@ async def lifespan(app: FastAPI):
     logger.info("  Max running:   %s", Config.MAX_RUNNING_COMPUTERS)
     logger.info("  Idle timeout:  %s min", Config.IDLE_TIMEOUT_MINUTES)
     logger.info("  Host address:  %s", Config.HOST_ADDRESS)
+    logger.info("  Public base:   %s", Config.PUBLIC_BASE_URL)
+    logger.info("  Auth:          %s", "anonymous (dev only!)"
+                if Config.ALLOW_ANONYMOUS else ("configured" if Config.API_KEY else "MISSING — non-health endpoints will 503"))
+
+    if not Config.VNC_PASSWORD:
+        raise RuntimeError(
+            "VNC_PASSWORD is not set — refusing to boot desktops with a default "
+            "password. Set VNC_PASSWORD in Coolify (runtime var) and redeploy."
+        )
 
     # Reconcile DB with Docker state on startup
     await docker_manager.reconcile()
@@ -95,13 +134,19 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Computer on Demand",
     description="Spin up, stop, resume, and snapshot desktop computers for AI models.",
-    version="0.1.0",
+    version="0.2.0",
     lifespan=lifespan,
 )
 
+app.add_middleware(AuthMiddleware)
+
+# Default-deny CORS: agent traffic is server-side and needs none; browser
+# callers (VNC viewer) are allowlisted via CORS_ORIGINS.
+from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=Config.CORS_ORIGINS,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -120,10 +165,16 @@ def _make_endpoints(comp: dict) -> Endpoints | None:
     if comp["status"] != "running":
         return None
     host = Config.HOST_ADDRESS
+    base = Config.PUBLIC_BASE_URL.rstrip("/")
+    cid = comp["id"]
     return Endpoints(
         vnc=f"http://{host}:{comp['vnc_port']}",
         computer_server=f"http://{host}:{comp['cs_port']}",
         cdp=f"http://{host}:{comp['cdp_port']}",
+        # Broker-proxied URLs: the only ones a remote agent needs. Starship
+        # talks to these — never to the raw host ports above.
+        broker_mcp_url=f"{base}/computers/{cid}/mcp",
+        broker_api_url=f"{base}/computers/{cid}/api",
     )
 
 
@@ -132,6 +183,7 @@ def _to_response(comp: dict) -> ComputerResponse:
         id=comp["id"],
         name=comp["name"],
         status=ComputerStatus(comp["status"]),
+        owner=comp.get("owner"),
         endpoints=_make_endpoints(comp),
         cpu_limit=comp["cpu_limit"],
         memory_limit=comp["memory_limit"],
@@ -157,6 +209,22 @@ async def _do_stop(computer_id: str) -> dict:
     return comp
 
 
+async def _gc_failed_create(computer_id: str) -> None:
+    """Remove all traces of a create that never became healthy.
+
+    Without this, failed creates sit in `error` holding their port triple
+    forever and the pool slowly drains. Best-effort: never raise.
+    """
+    try:
+        await docker_manager.remove_container(computer_id)
+    except Exception:
+        logger.warning("GC: container removal failed for %s", computer_id, exc_info=True)
+    try:
+        await db.delete_computer(computer_id)
+    except Exception:
+        logger.warning("GC: row delete failed for %s", computer_id, exc_info=True)
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -174,9 +242,22 @@ async def health():
 
 @app.post("/computers", response_model=ComputerResponse, status_code=201)
 async def create_computer(req: CreateComputerRequest | None = None):
-    """Create and start a new computer."""
+    """Create and start a new computer.
+
+    Idempotent per owner: repeat POSTs with the same `owner` (e.g.
+    `starship:conv-<id>`) return the existing creating/running computer
+    instead of spawning a duplicate. Claim once per agent, reuse the id.
+    """
     if req is None:
         req = CreateComputerRequest()
+
+    # Idempotent reclaim — one owner, one live computer.
+    if req.owner:
+        existing = await db.get_computer_by_owner(req.owner)
+        if existing is not None and existing["status"] in ("creating", "running"):
+            await db.touch_activity(existing["id"])
+            existing = await db.get_computer(existing["id"])
+            return _to_response(existing)
 
     # Check limits
     running = await db.count_running()
@@ -195,28 +276,32 @@ async def create_computer(req: CreateComputerRequest | None = None):
             f"Destroy unused computers first.",
         )
 
-    # Allocate
+    # Allocate — port-triple selection and row insert happen atomically
+    # inside reserve_computer (no check-then-act race under parallel claims).
     computer_id = _short_id()
     name = req.name or f"computer-{computer_id}"
     cpu_limit = req.cpu_limit or Config.DEFAULT_CPU_LIMIT
     memory_limit = req.memory_limit or Config.DEFAULT_MEMORY_LIMIT
     resolution = req.resolution or Config.DEFAULT_RESOLUTION
 
-    vnc_port, cs_port, cdp_port = await docker_manager.allocate_ports()
+    try:
+        comp = await db.reserve_computer(
+            computer_id=computer_id,
+            name=name,
+            owner=req.owner,
+            cpu_limit=cpu_limit,
+            memory_limit=memory_limit,
+            shm_size=Config.DEFAULT_SHM_SIZE,
+            resolution=resolution,
+            vnc_start=Config.PORT_RANGE_VNC_START,
+            cs_start=Config.PORT_RANGE_COMPUTER_START,
+            cdp_start=Config.PORT_RANGE_CDP_START,
+            range_size=Config.PORT_RANGE_SIZE,
+        )
+    except RuntimeError as e:
+        raise HTTPException(status_code=429, detail=str(e))
 
-    # Create DB record
-    comp = await db.create_computer(
-        computer_id=computer_id,
-        name=name,
-        container_id=None,
-        vnc_port=vnc_port,
-        cs_port=cs_port,
-        cdp_port=cdp_port,
-        cpu_limit=cpu_limit,
-        memory_limit=memory_limit,
-        shm_size=Config.DEFAULT_SHM_SIZE,
-        resolution=resolution,
-    )
+    vnc_port, cs_port, cdp_port = comp["vnc_port"], comp["cs_port"], comp["cdp_port"]
 
     # Create and start Docker container
     try:
@@ -237,15 +322,16 @@ async def create_computer(req: CreateComputerRequest | None = None):
         if healthy:
             comp = await db.update_computer(computer_id, status="running")
         else:
-            comp = await db.update_computer(computer_id, status="error")
+            await _gc_failed_create(computer_id)
             raise HTTPException(
                 status_code=503,
-                detail="Computer started but computer-server did not become healthy in time.",
+                detail="Computer started but computer-server did not become healthy in time. "
+                "Claim cleaned up — retry the request.",
             )
     except HTTPException:
         raise
     except Exception as e:
-        await db.update_computer(computer_id, status="error")
+        await _gc_failed_create(computer_id)
         logger.exception("Failed to create computer %s", computer_id)
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -253,9 +339,9 @@ async def create_computer(req: CreateComputerRequest | None = None):
 
 
 @app.get("/computers", response_model=ComputerListResponse)
-async def list_computers():
-    """List all computers (running + stopped)."""
-    computers = await db.list_computers()
+async def list_computers(owner: str | None = None):
+    """List all computers (running + stopped). Filter by claim owner."""
+    computers = await db.list_computers(owner=owner)
     running = sum(1 for c in computers if c["status"] == "running")
     return ComputerListResponse(
         computers=[_to_response(c) for c in computers],
@@ -272,6 +358,114 @@ async def get_computer(computer_id: str):
         raise HTTPException(status_code=404, detail="Computer not found")
     await db.touch_activity(computer_id)
     return _to_response(comp)
+
+
+@app.post("/computers/{computer_id}/heartbeat", response_model=ComputerResponse)
+async def heartbeat_computer(computer_id: str):
+    """Agent keep-alive: marks activity so the idle reaper spares this computer.
+
+    Agents with long-running tasks should hit this (or any proxied guest
+    route, which also touches activity) more often than IDLE_TIMEOUT_MINUTES.
+    """
+    comp = await db.get_computer(computer_id)
+    if comp is None:
+        raise HTTPException(status_code=404, detail="Computer not found")
+    if comp["status"] != "running":
+        raise HTTPException(status_code=409, detail=f"Computer is {comp['status']}, not running")
+    await db.touch_activity(computer_id)
+    comp = await db.get_computer(computer_id)
+    return _to_response(comp)
+
+
+# ---------------------------------------------------------------------------
+# Broker-proxied guest routes — remote agents talk ONLY to these.
+#
+# Raw host ports (6901+/8001+/9223+) are not exposed through Coolify, so the
+# direct URLs in `endpoints` only work on the host/LAN. These proxied routes
+# ride the broker's own :3000 listener (i.e. the public FQDN) instead.
+# Every proxied call counts as activity for the idle reaper.
+# ---------------------------------------------------------------------------
+
+# Hop-by-hop headers that must never cross the proxy boundary.
+_HOP_HEADERS = {
+    "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+    "te", "trailer", "transfer-encoding", "upgrade",
+}
+# Allowlisted request/response headers (MCP session affinity lives here).
+_PASS_HEADERS = {
+    "content-type", "accept", "mcp-session-id", "mcp-protocol-version",
+    "last-event-id", "user-agent",
+}
+
+
+async def _proxy_to_guest(request: Request, comp: dict, guest_path: str, timeout: float | None):
+    """Stream request → guest computer-server → response. Never buffers SSE."""
+    url = f"http://127.0.0.1:{comp['cs_port']}/{guest_path.lstrip('/')}"
+    fwd = {k: v for k, v in request.headers.items() if k.lower() in _PASS_HEADERS}
+    body = await request.body()
+    client = httpx.AsyncClient(timeout=timeout)
+    try:
+        upstream = await client.send(
+            client.build_request(request.method, url, headers=fwd, content=body),
+            stream=True,
+        )
+    except httpx.ConnectError:
+        await client.aclose()
+        raise HTTPException(status_code=502, detail="Guest computer-server unreachable.")
+
+    async def _aiter():
+        try:
+            async for chunk in upstream.aiter_bytes():
+                yield chunk
+        finally:
+            await upstream.aclose()
+            await client.aclose()
+
+    out_headers = {k: v for k, v in upstream.headers.items() if k.lower() in _PASS_HEADERS}
+    await db.touch_activity(comp["id"])
+    return StreamingResponse(_aiter(), status_code=upstream.status_code, headers=out_headers)
+
+
+async def _require_running_guest(computer_id: str) -> dict:
+    comp = await db.get_computer(computer_id)
+    if comp is None:
+        raise HTTPException(status_code=404, detail="Computer not found")
+    if comp["status"] != "running":
+        raise HTTPException(status_code=409, detail=f"Computer is {comp['status']}, not running")
+    return comp
+
+
+@app.api_route(
+    "/computers/{computer_id}/mcp",
+    methods=["GET", "POST", "DELETE"],
+    include_in_schema=True,
+)
+async def proxy_mcp(computer_id: str, request: Request):
+    """computer-server MCP (streamable HTTP) via the broker.
+
+    This is the primary agent contract: point an MCP client at the returned
+    `broker_mcp_url` and drive screenshot/click/type/shell/file tools.
+    GET opens the long-lived SSE stream — proxied without buffering.
+    """
+    comp = await _require_running_guest(computer_id)
+    return await _proxy_to_guest(request, comp, "mcp", timeout=None)
+
+
+@app.api_route(
+    "/computers/{computer_id}/api/{guest_path:path}",
+    methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
+    include_in_schema=True,
+)
+async def proxy_guest_api(computer_id: str, guest_path: str, request: Request):
+    """computer-server REST API via the broker (`/cmd`, `/status`, ...)."""
+    comp = await _require_running_guest(computer_id)
+    return await _proxy_to_guest(request, comp, guest_path or "/", timeout=120.0)
+
+
+@app.get("/computers/{computer_id}/api", include_in_schema=False)
+async def proxy_guest_api_root(computer_id: str, request: Request):
+    comp = await _require_running_guest(computer_id)
+    return await _proxy_to_guest(request, comp, "/", timeout=120.0)
 
 
 @app.post("/computers/{computer_id}/stop", response_model=ComputerResponse)

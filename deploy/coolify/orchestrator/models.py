@@ -29,6 +29,11 @@ class CreateComputerRequest(BaseModel):
         default=None,
         description="Human-friendly label. Auto-generated if omitted.",
     )
+    owner: str | None = Field(
+        default=None,
+        description="Claim owner, e.g. 'starship:conv-<id>'. Repeat POSTs with the "
+        "same owner return the existing computer instead of creating a new one.",
+    )
     cpu_limit: str | None = Field(
         default=None,
         description="Max CPUs, e.g. '1.0'. Uses server default if omitted.",
@@ -57,9 +62,16 @@ class RestoreRequest(BaseModel):
 class Endpoints(BaseModel):
     """Connection endpoints for a running computer."""
 
-    vnc: str = Field(description="KasmVNC web desktop URL")
-    computer_server: str = Field(description="Cua computer-server REST/MCP URL")
-    cdp: str = Field(description="Chrome DevTools Protocol URL")
+    vnc: str = Field(description="KasmVNC web desktop URL (direct host port)")
+    computer_server: str = Field(description="Cua computer-server REST/MCP URL (direct host port)")
+    cdp: str = Field(description="Chrome DevTools Protocol URL (direct host port)")
+    broker_mcp_url: str = Field(
+        description="MCP endpoint proxied through this broker — the one remote "
+        "agents should use (no direct host-port access needed)."
+    )
+    broker_api_url: str = Field(
+        description="computer-server REST API proxied through this broker."
+    )
 
 
 class ComputerResponse(BaseModel):
@@ -68,6 +80,7 @@ class ComputerResponse(BaseModel):
     id: str
     name: str
     status: ComputerStatus
+    owner: str | None = Field(default=None, description="Claim owner, if set.")
     endpoints: Endpoints | None = Field(
         default=None,
         description="Connection endpoints. Only present when status is 'running'.",

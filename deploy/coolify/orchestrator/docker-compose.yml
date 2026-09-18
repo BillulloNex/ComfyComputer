@@ -18,16 +18,20 @@ services:
     environment:
       # Docker image used for computers (build separately via Coolify)
       - COMPUTER_IMAGE=agent-computer:latest
+      # Auth: fail-closed unless a key is set. Dev default only — Coolify
+      # MUST set a real ORCHESTRATOR_API_KEY (runtime var).
+      - ORCHESTRATOR_API_KEY=${ORCHESTRATOR_API_KEY:-dev-key-change-me}
+      - PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-http://localhost:3000}
       # Max concurrent running computers (4 vCPU / 16 GB server ≈ 3)
       - MAX_RUNNING_COMPUTERS=3
       # Max total computers (including stopped)
       - MAX_TOTAL_COMPUTERS=20
-      # Public host address for endpoint URLs returned by the API
+      # Public host address for direct (host/LAN-only) endpoint URLs
       - HOST_ADDRESS=${HOST_ADDRESS:-localhost}
       # Auto-stop idle computers after 30 minutes
       - IDLE_TIMEOUT_MINUTES=30
-      # VNC password for spawned computers
-      - VNC_PASSWORD=kasm123
+      # VNC password for spawned computers (required — no default)
+      - VNC_PASSWORD=${VNC_PASSWORD:-dev-vnc-change-me}
 
 volumes:
   orchestrator-data:
