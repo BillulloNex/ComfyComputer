@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import secrets
 import uuid
 from contextlib import asynccontextmanager
@@ -237,6 +238,8 @@ async def health():
         status="ok",
         running_computers=running,
         max_running=Config.MAX_RUNNING_COMPUTERS,
+        docker_socket_present=os.path.exists("/var/run/docker.sock"),
+        docker_reachable=await docker_manager.docker_ping(),
     )
 
 

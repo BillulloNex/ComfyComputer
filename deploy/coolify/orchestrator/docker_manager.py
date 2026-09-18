@@ -27,6 +27,21 @@ def _docker() -> docker.DockerClient:
     return _client
 
 
+async def docker_ping() -> bool:
+    """Best-effort Docker daemon ping for /health. Never raises."""
+    def _ping() -> bool:
+        try:
+            _docker().ping()
+            return True
+        except Exception:
+            return False
+
+    try:
+        return await asyncio.get_event_loop().run_in_executor(None, _ping)
+    except Exception:
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Network
 # ---------------------------------------------------------------------------

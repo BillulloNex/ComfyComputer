@@ -122,6 +122,14 @@ class HealthResponse(BaseModel):
     status: str = "ok"
     running_computers: int
     max_running: int
+    docker_socket_present: bool = Field(
+        default=False,
+        description="Whether /var/run/docker.sock exists in this container.",
+    )
+    docker_reachable: bool = Field(
+        default=False,
+        description="Whether the Docker daemon answered a ping.",
+    )
 
 
 class ErrorResponse(BaseModel):
