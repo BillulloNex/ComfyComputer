@@ -6,7 +6,12 @@ ENV STARTUPDIR=/dockerstartup
 WORKDIR $HOME
 
 # 1. System packages & dependencies
-RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+# NOTE: the kasmweb base image ships a HashiCorp apt source whose GPG key is
+# no longer valid (NO_PUBKEY FC9CA96ACA026560) — apt-get update hard-fails on
+# it, which broke desktop rebuilds on 2026-09-18. The repo is unused by this
+# image, so drop it before updating.
+RUN rm -f /etc/apt/sources.list.d/hashicorp.list* /etc/apt/sources.list.d/hashicorp.sources \
+    && apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
     wget \
     curl \
     gnupg \
