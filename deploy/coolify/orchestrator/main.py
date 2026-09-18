@@ -654,6 +654,20 @@ async def delete_computer(computer_id: str):
 
 
 # ---------------------------------------------------------------------------
+# Admin (auth-gated): host introspection for ops
+# ---------------------------------------------------------------------------
+
+
+@app.get("/admin/images")
+async def admin_images():
+    """List desktop-candidate images present on the host daemon."""
+    return {
+        "default_image": Config.COMPUTER_IMAGE,
+        "images": await docker_manager.list_images(),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 

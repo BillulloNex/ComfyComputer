@@ -239,6 +239,25 @@ async def snapshot_container(computer_id: str, label: str | None = None) -> str:
     return await asyncio.get_event_loop().run_in_executor(None, _commit)
 
 
+async def list_images() -> list[dict]:
+    """Images present on the host daemon (tag + size). Never raises."""
+
+    def _list() -> list[dict]:
+        try:
+            out = []
+            for img in _docker().images.list():
+                out.append({
+                    "tags": img.tags or [],
+                    "id": (img.id or "")[:19],
+                    "size_mb": round((img.attrs.get("Size", 0) or 0) / 1e6, 1),
+                })
+            return out
+        except Exception as e:
+            return [{"error": str(e)}]
+
+    return await asyncio.get_event_loop().run_in_executor(None, _list)
+
+
 async def get_container_status(computer_id: str) -> str | None:
     """Return the Docker container status string, or None if not found."""
     client = _docker()
