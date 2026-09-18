@@ -99,7 +99,7 @@ async def _boot_computer(computer_id: str) -> None:
             resolution=comp["resolution"],
         )
         await db.update_computer(computer_id, container_id=container_id)
-        healthy = await docker_manager.wait_for_healthy(comp["cs_port"])
+        healthy = await docker_manager.wait_for_healthy(docker_manager.guest_host(), comp["cs_port"])
         await db.update_computer(
             computer_id, status="running" if healthy else "error",
         )
@@ -396,7 +396,7 @@ _PASS_HEADERS = {
 
 async def _proxy_to_guest(request: Request, comp: dict, guest_path: str, timeout: float | None):
     """Stream request → guest computer-server → response. Never buffers SSE."""
-    url = f"http://127.0.0.1:{comp['cs_port']}/{guest_path.lstrip('/')}"
+    url = f"{docker_manager.guest_api_base(comp['cs_port'])}/{guest_path.lstrip('/')}"
     fwd = {k: v for k, v in request.headers.items() if k.lower() in _PASS_HEADERS}
     body = await request.body()
     client = httpx.AsyncClient(timeout=timeout)
@@ -517,7 +517,7 @@ async def start_computer(computer_id: str):
             await db.update_computer(computer_id, container_id=container_id)
 
         # Wait for healthy
-        healthy = await docker_manager.wait_for_healthy(comp["cs_port"])
+        healthy = await docker_manager.wait_for_healthy(docker_manager.guest_host(), comp["cs_port"])
         if healthy:
             comp = await db.update_computer(
                 computer_id, status="running", stopped_at=None,
@@ -617,7 +617,7 @@ async def restore_computer(computer_id: str, req: RestoreRequest):
         )
         await db.update_computer(computer_id, container_id=container_id)
 
-        healthy = await docker_manager.wait_for_healthy(comp["cs_port"])
+        healthy = await docker_manager.wait_for_healthy(docker_manager.guest_host(), comp["cs_port"])
         if healthy:
             comp = await db.update_computer(computer_id, status="running", stopped_at=None)
         else:

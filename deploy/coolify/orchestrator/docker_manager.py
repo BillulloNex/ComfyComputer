@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from datetime import datetime, timezone
 
 import docker
@@ -64,6 +65,42 @@ def ensure_network() -> None:
 # (triple selection + row insert under one lock). Do NOT reintroduce an
 # allocate-then-insert split here — parallel claims will collide.
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Guest addressing
+#
+# The broker runs in its own container, so 127.0.0.1 NEVER reaches a guest's
+# host-published ports (loopback is per-network-namespace). Guests are
+# reached through an address that routes to the host from inside this
+# container: explicit GUEST_HOST env wins, otherwise the container's default
+# gateway (host-published ports bind 0.0.0.0, so the gateway always works).
+# ---------------------------------------------------------------------------
+
+
+def guest_host() -> str:
+    """Host (from this container's POV) where guest ports are reachable."""
+    explicit = os.getenv("GUEST_HOST", "").strip()
+    if explicit:
+        return explicit
+    # Default gateway of this container — host-published ports answer there.
+    try:
+        with open("/proc/net/route") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 3 and parts[1] == "00000000":
+                    gw_hex = parts[2]
+                    gw_int = int(gw_hex, 16)
+                    return ".".join(
+                        str((gw_int >> (8 * i)) & 0xFF) for i in range(4)
+                    )
+    except Exception:
+        logger.warning("Could not read default gateway, falling back", exc_info=True)
+    return Config.HOST_ADDRESS
+
+
+def guest_api_base(cs_port: int) -> str:
+    """Base URL for a guest's computer-server, broker-reachable."""
+    return f"http://{guest_host()}:{cs_port}"
 
 
 # ---------------------------------------------------------------------------
@@ -278,9 +315,12 @@ async def get_container_status(computer_id: str) -> str | None:
 # ---------------------------------------------------------------------------
 
 
-async def wait_for_healthy(cs_port: int) -> bool:
-    """Poll computer-server /status until it responds 200 or timeout."""
-    url = f"http://127.0.0.1:{cs_port}/status"
+async def wait_for_healthy(host: str, cs_port: int) -> bool:
+    """Poll guest computer-server /status until 200 or timeout.
+
+    `host` must be broker-reachable (see guest_host) — never 127.0.0.1.
+    """
+    url = f"http://{host}:{cs_port}/status"
     deadline = asyncio.get_event_loop().time() + Config.HEALTH_CHECK_TIMEOUT
 
     async with httpx.AsyncClient() as client:
@@ -288,13 +328,13 @@ async def wait_for_healthy(cs_port: int) -> bool:
             try:
                 resp = await client.get(url, timeout=3)
                 if resp.status_code == 200:
-                    logger.info("Computer healthy on port %d", cs_port)
+                    logger.info("Computer healthy at %s", url)
                     return True
             except (httpx.ConnectError, httpx.ReadTimeout, httpx.ConnectTimeout):
                 pass
             await asyncio.sleep(Config.HEALTH_CHECK_INTERVAL)
 
-    logger.error("Health check timed out for port %d", cs_port)
+    logger.error("Health check timed out for %s", url)
     return False
 
 
